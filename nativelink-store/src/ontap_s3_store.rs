@@ -1,4 +1,4 @@
-// Copyright 2024 The NativeLink Authors. All rights reserved.
+// Copyright 2025 The NativeLink Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +19,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{cmp, env};
+use std::fs::File;
+use std::io::BufReader;
+use rustls::{Certificate, ClientConfig, RootCertStore};
+use rustls_pemfile::certs;
 
 use async_trait::async_trait;
-use aws_config::default_provider::credentials;
-use aws_config::{AppName, BehaviorVersion};
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -40,7 +44,7 @@ use http_body::{Frame, SizeHint};
 use hyper::client::connect::{Connected, Connection, HttpConnector};
 use hyper::service::Service;
 use hyper::Uri;
-use hyper_rustls::{HttpsConnector, MaybeHttpsStream};
+use hyper_rustls::{ConfigBuilderExt, HttpsConnector, MaybeHttpsStream};
 use nativelink_config::stores::OntapS3Spec;
 // Note: Ontap S3 store should be very careful about the error codes it returns
 // when in a retryable wrapper. Always prefer Code::Aborted or another
@@ -253,6 +257,38 @@ pub struct OntapS3Store<NowFn> {
     multipart_max_concurrent_uploads: usize,
 }
 
+pub fn load_custom_certs(cert_path: &str) -> Result<Arc<ClientConfig>, Error> {
+    let mut root_store = RootCertStore::empty();
+
+    // Create a BufReader from the cert file
+    let mut cert_reader = BufReader::new(
+        File::open(cert_path)
+            .map_err(|e| make_err!(Code::Internal, "Failed to open CA certificate file: {e:?}"))?,
+    );
+
+    // Parse certificates
+    let certs = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| make_err!(Code::Internal, "Failed to parse certificates: {e:?}"))?;
+
+    // Add each certificate to the root store
+    for cert in certs {
+        root_store.add(&Certificate(cert.to_vec())).map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "Failed to add certificate to root store: {e:?}"
+            )
+        })?;
+    }
+
+    // Build the client config with the root store
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(Arc::new(config))
+}
 impl<I, NowFn> OntapS3Store<NowFn>
 where
     I: InstantWrapper,
@@ -268,33 +304,66 @@ where
             let max = 1. + (jitter_amt / 2.);
             delay.mul_f32(rand::rng().random_range(min..max))
         });
-        let s3_client = {
-            let http_client =
-                HyperClientBuilder::new().build(TlsConnector::new(spec, jitter_fn.clone()));
-            let credential_provider = credentials::default_provider().await;
-            let mut config_builder = aws_config::defaults(BehaviorVersion::v2024_03_28())
-                // TODO(aaronmondal): Flip these to the default "WhenSupported".
-                //                    See: https://github.com/awslabs/aws-sdk-rust/releases/tag/release-2025-01-15
-                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-                .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
-                .credentials_provider(credential_provider)
-                .app_name(AppName::new("nativelink").expect("valid app name"))
-                .timeout_config(
-                    aws_config::timeout::TimeoutConfig::builder()
-                        .connect_timeout(Duration::from_secs(15))
-                        .build(),
-                )
-                .region(Region::new(Cow::Owned(spec.region.clone())))
-                .http_client(http_client);
-            // TODO(allada) When aws-sdk supports this env variable we should be able
-            // to remove this.
-            // See: https://github.com/awslabs/aws-sdk-rust/issues/932
-            if let Ok(endpoint_url) = env::var("AWS_ENDPOINT_URL") {
-                config_builder = config_builder.endpoint_url(endpoint_url);
-            }
-            aws_sdk_s3::Client::new(&config_builder.load().await)
+    
+        // Load custom CA config
+        let ca_config = if let Some(cert_path) = &spec.root_certificates {
+            load_custom_certs(cert_path)?
+        } else {
+            Arc::new(
+                ClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_native_roots()
+                    .with_no_client_auth(),
+            )
         };
-        Self::new_with_client_and_jitter(spec, s3_client, jitter_fn, now_fn)
+    
+        let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config((*ca_config).clone())
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .build();
+    
+        let http_client = HyperClientBuilder::new().build(https_connector);
+    
+        let credentials_provider = DefaultCredentialsChain::builder().build().await;
+    
+        let config = aws_sdk_s3::Config::builder()
+            .credentials_provider(credentials_provider)
+            .endpoint_url(&spec.endpoint)
+            .region(Region::new(spec.vserver_name.clone()))
+            .app_name(aws_config::AppName::new("nativelink").expect("valid app name"))
+            .http_client(http_client)
+            .force_path_style(true)
+            .behavior_version(BehaviorVersion::v2024_03_28())
+            .timeout_config(
+                aws_config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_secs(30))
+                    .operation_timeout(Duration::from_secs(120))
+                    .build(),
+            )
+            .build();
+    
+        let s3_client = aws_sdk_s3::Client::from_conf(config);
+    
+        Ok(Arc::new(Self {
+            s3_client: Arc::new(s3_client),
+            now_fn,
+            bucket: spec.bucket.clone(),
+            key_prefix: spec.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
+            retrier: Retrier::new(
+                Arc::new(|duration| Box::pin(sleep(duration))),
+                jitter_fn,
+                spec.retry.clone(),
+            ),
+            consider_expired_after_s: i64::from(spec.consider_expired_after_s),
+            max_retry_buffer_per_request: spec
+                .max_retry_buffer_per_request
+                .unwrap_or(DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST),
+            multipart_max_concurrent_uploads: spec
+                .multipart_max_concurrent_uploads
+                .unwrap_or(DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS),
+        }))
     }
 
     pub fn new_with_client_and_jitter(
@@ -357,7 +426,7 @@ where
                         Some((
                             RetryResult::Err(make_err!(
                                 Code::InvalidArgument,
-                                "Negative content length in S3: {length:?}",
+                                "Negative content length in Ontap S3: {length:?}",
                             )),
                             state,
                         ))
@@ -417,14 +486,6 @@ where
             UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
         };
 
-        // Note(allada) It might be more optimal to use a different
-        // heuristic here, but for simplicity we use a hard coded value.
-        // Anything going down this if-statement will have the advantage of only
-        // 1 network request for the upload instead of minimum of 3 required for
-        // multipart upload requests.
-        //
-        // Note(allada) If the upload size is not known, we go down the multipart upload path.
-        // This is not very efficient, but it greatly reduces the complexity of the code.
         if max_size < MIN_MULTIPART_SIZE && matches!(upload_size, UploadSizeInfo::ExactSize(_)) {
             let UploadSizeInfo::ExactSize(sz) = upload_size else {
                 unreachable!("upload_size must be UploadSizeInfo::ExactSize here");
@@ -440,7 +501,7 @@ where
                     // back the body after we send it in order to retry.
                     let (mut tx, rx) = make_buf_channel_pair();
 
-                    // Upload the data to the Ontap S3 backend.
+                    // Upload the data to the S3 backend.
                     let result = {
                         let reader_ref = &mut reader;
                         let (upload_res, bind_res) = tokio::join!(
@@ -515,7 +576,7 @@ where
                                 || {
                                     RetryResult::Err(make_err!(
                                         Code::Internal,
-                                        "Expected upload_id to be set by Ontap s3 response"
+                                        "Expected upload_id to be set by s3 response"
                                     ))
                                 },
                                 RetryResult::Ok,
@@ -526,7 +587,7 @@ where
             }))
             .await?;
 
-        // S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
+        // Ontap S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
         // 5mb (except last part) and can have up to 10,000 parts.
         let bytes_per_upload_part =
             (max_size / (MIN_MULTIPART_SIZE - 1)).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
@@ -730,12 +791,12 @@ where
                     },
                 };
 
-                // Copy data from s3 input stream to the writer stream.
+                // Copy data from Ontap s3 input stream to the writer stream.
                 while let Some(maybe_bytes) = s3_in_stream.next().await {
                     match maybe_bytes {
                         Ok(bytes) => {
                             if bytes.is_empty() {
-                                // Ignore possible EOF. Different implimentations of S3 may or may not
+                                // Ignore possible EOF. Different implimentations of Ontap S3 may or may not
                                 // send EOF this way.
                                 continue;
                             }
