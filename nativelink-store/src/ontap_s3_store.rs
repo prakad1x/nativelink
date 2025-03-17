@@ -41,8 +41,8 @@ use hyper::client::connect::{Connected, Connection, HttpConnector};
 use hyper::service::Service;
 use hyper::Uri;
 use hyper_rustls::{HttpsConnector, MaybeHttpsStream};
-use nativelink_config::stores::S3Spec;
-// Note: S3 store should be very careful about the error codes it returns
+use nativelink_config::stores::OntapS3Spec;
+// Note: Ontap S3 store should be very careful about the error codes it returns
 // when in a retryable wrapper. Always prefer Code::Aborted or another
 // retryable code over Code::InvalidArgument or make_input_err!().
 // ie: Don't import make_input_err!() to help prevent this.
@@ -142,7 +142,7 @@ pub struct TlsConnector {
 
 impl TlsConnector {
     #[must_use]
-    pub fn new(spec: &S3Spec, jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>) -> Self {
+    pub fn new(spec: &OntapS3Spec, jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>) -> Self {
         let connector_with_roots = hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots();
 
         let connector_with_schemes = if spec.insecure_allow_http {
@@ -184,7 +184,7 @@ impl TlsConnector {
                 Err(e) => Some((
                     RetryResult::Retry(make_err!(
                         Code::Unavailable,
-                        "Failed to call S3 connector: {e:?}"
+                        "Failed to call Ontap S3 connector: {e:?}"
                     )),
                     connector,
                 )),
@@ -203,7 +203,7 @@ impl Service<Uri> for TlsConnector {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.connector
             .poll_ready(cx)
-            .map_err(|e| make_err!(Code::Unavailable, "Failed poll in S3: {e}"))
+            .map_err(|e| make_err!(Code::Unavailable, "Failed poll in Ontap S3: {e}"))
     }
 
     fn call(&mut self, req: Uri) -> Self::Future {
@@ -237,12 +237,12 @@ impl http_body::Body for BodyWrapper {
 }
 
 #[derive(MetricsComponent)]
-pub struct S3Store<NowFn> {
+pub struct OntapS3Store<NowFn> {
     s3_client: Arc<Client>,
     now_fn: NowFn,
-    #[metric(help = "The bucket name for the S3 store")]
+    #[metric(help = "The bucket name for the Ontap S3 store")]
     bucket: String,
-    #[metric(help = "The key prefix for the S3 store")]
+    #[metric(help = "The key prefix for the Ontap S3 store")]
     key_prefix: String,
     retrier: Retrier,
     #[metric(help = "The number of seconds to consider an object expired")]
@@ -253,12 +253,12 @@ pub struct S3Store<NowFn> {
     multipart_max_concurrent_uploads: usize,
 }
 
-impl<I, NowFn> S3Store<NowFn>
+impl<I, NowFn> OntapS3Store<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
-    pub async fn new(spec: &S3Spec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
+    pub async fn new(spec: &OntapS3Spec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
         let jitter_amt = spec.retry.jitter;
         let jitter_fn = Arc::new(move |delay: Duration| {
             if jitter_amt == 0. {
@@ -298,7 +298,7 @@ where
     }
 
     pub fn new_with_client_and_jitter(
-        spec: &S3Spec,
+        spec: &OntapS3Spec,
         s3_client: Client,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
@@ -367,7 +367,7 @@ where
                         other => Some((
                             RetryResult::Retry(make_err!(
                                 Code::Unavailable,
-                                "Unhandled HeadObjectError in S3: {other:?}"
+                                "Unhandled HeadObjectError in Ontap S3: {other:?}"
                             )),
                             state,
                         )),
@@ -379,7 +379,7 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn> StoreDriver for S3Store<NowFn>
+impl<I, NowFn> StoreDriver for OntapS3Store<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
@@ -440,7 +440,7 @@ where
                     // back the body after we send it in order to retry.
                     let (mut tx, rx) = make_buf_channel_pair();
 
-                    // Upload the data to the S3 backend.
+                    // Upload the data to the Ontap S3 backend.
                     let result = {
                         let reader_ref = &mut reader;
                         let (upload_res, bind_res) = tokio::join!(
@@ -460,7 +460,7 @@ where
                         );
                         upload_res
                             .merge(bind_res)
-                            .err_tip(|| "Failed to upload file to s3 in single chunk")
+                            .err_tip(|| "Failed to upload file to Ontap s3 in single chunk")
                     };
 
                     // If we failed to upload the file, check to see if we can retry.
@@ -473,18 +473,18 @@ where
                                 Level::ERROR,
                                 ?bytes_received,
                                 err = ?try_reset_err,
-                                "Unable to reset stream after failed upload in S3Store::update"
+                                "Unable to reset stream after failed upload in OntapS3Store::update"
                             );
                             return RetryResult::Err(err
                                 .merge(try_reset_err)
-                                .append(format!("Failed to retry upload with {bytes_received} bytes received in S3Store::update")));
+                                .append(format!("Failed to retry upload with {bytes_received} bytes received in OntapS3Store::update")));
                         }
-                        let err = err.append(format!("Retry on upload happened with {bytes_received} bytes received in S3Store::update"));
+                        let err = err.append(format!("Retry on upload happened with {bytes_received} bytes received in OntapS3Store::update"));
                         event!(
                             Level::INFO,
                             ?err,
                             ?bytes_received,
-                            "Retryable S3 error"
+                            "Retryable Ontap S3 error"
                         );
                         RetryResult::Retry(err)
                     }, |()| RetryResult::Ok(()));
@@ -507,7 +507,7 @@ where
                         |e| {
                             RetryResult::Retry(make_err!(
                                 Code::Aborted,
-                                "Failed to create multipart upload to s3: {e:?}"
+                                "Failed to create multipart upload to Ontap s3: {e:?}"
                             ))
                         },
                         |CreateMultipartUploadOutput { upload_id, .. }| {
@@ -515,7 +515,7 @@ where
                                 || {
                                     RetryResult::Err(make_err!(
                                         Code::Internal,
-                                        "Expected upload_id to be set by s3 response"
+                                        "Expected upload_id to be set by Ontap s3 response"
                                     ))
                                 },
                                 RetryResult::Ok,
@@ -543,7 +543,7 @@ where
                     let write_buf = reader
                         .consume(Some(usize::try_from(bytes_per_upload_part).err_tip(|| "Could not convert bytes_per_upload_part to usize")?))
                         .await
-                        .err_tip(|| "Failed to read chunk in s3_store")?;
+                        .err_tip(|| "Failed to read chunk in ontap_s3_store")?;
                     if write_buf.is_empty() {
                         break; // Reached EOF.
                     }
@@ -566,7 +566,7 @@ where
                                         |e| {
                                             RetryResult::Retry(make_err!(
                                                 Code::Aborted,
-                                                "Failed to upload part {part_number} in S3 store: {e:?}"
+                                                "Failed to upload part {part_number} in Ontap S3 store: {e:?}"
                                             ))
                                         },
                                         |mut response| {
@@ -584,7 +584,7 @@ where
                                 Some((retry_result, write_buf))
                             }
                         }
-                    ))).await.map_err(|_| make_err!(Code::Internal, "Failed to send part to channel in s3_store"))?;
+                    ))).await.map_err(|_| make_err!(Code::Internal, "Failed to send part to channel in ontap_s3_store"))?;
                 }
                 Result::<_, Error>::Ok(())
             }.fuse();
@@ -633,7 +633,7 @@ where
                                 |e| {
                                     RetryResult::Retry(make_err!(
                                         Code::Aborted,
-                                        "Failed to complete multipart upload in S3 store: {e:?}"
+                                        "Failed to complete multipart upload in Ontap S3 store: {e:?}"
                                     ))
                                 },
                                 |_| RetryResult::Ok(()),
@@ -660,7 +660,7 @@ where
                             |e| {
                                 let err = make_err!(
                                     Code::Aborted,
-                                    "Failed to abort multipart upload in S3 store : {e:?}"
+                                    "Failed to abort multipart upload in Ontap S3 store : {e:?}"
                                 );
                                 event!(Level::INFO, ?err, "Multipart upload error");
                                 Err(err)
@@ -713,7 +713,7 @@ where
                             return Some((
                                 RetryResult::Err(make_err!(
                                     Code::NotFound,
-                                    "No such key in S3: {e}"
+                                    "No such key in Ontap S3: {e}"
                                 )),
                                 writer,
                             ));
@@ -722,7 +722,7 @@ where
                             return Some((
                                 RetryResult::Retry(make_err!(
                                     Code::Unavailable,
-                                    "Unhandled GetObjectError in S3: {other:?}",
+                                    "Unhandled GetObjectError in Ontap S3: {other:?}",
                                 )),
                                 writer,
                             ));
@@ -743,7 +743,7 @@ where
                                 return Some((
                                     RetryResult::Err(make_err!(
                                         Code::Aborted,
-                                        "Error sending bytes to consumer in S3: {e}"
+                                        "Error sending bytes to consumer in Ontap S3: {e}"
                                     )),
                                     writer,
                                 ));
@@ -753,7 +753,7 @@ where
                             return Some((
                                 RetryResult::Retry(make_err!(
                                     Code::Aborted,
-                                    "Bad bytestream element in S3: {e}"
+                                    "Bad bytestream element in Ontap S3: {e}"
                                 )),
                                 writer,
                             ));
@@ -764,7 +764,7 @@ where
                     return Some((
                         RetryResult::Err(make_err!(
                             Code::Aborted,
-                            "Failed to send EOF to consumer in S3: {e}"
+                            "Failed to send EOF to consumer in Ontap S3: {e}"
                         )),
                         writer,
                     ));
@@ -792,13 +792,13 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn> HealthStatusIndicator for S3Store<NowFn>
+impl<I, NowFn> HealthStatusIndicator for OntapS3Store<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
     fn get_name(&self) -> &'static str {
-        "S3Store"
+        "OntapS3Store"
     }
 
     async fn check_health(&self, namespace: Cow<'static, str>) -> HealthStatus {
