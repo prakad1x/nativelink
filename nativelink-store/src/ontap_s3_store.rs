@@ -1,4 +1,4 @@
-// Copyright 2024 The NativeLink Authors. All rights reserved.
+// Copyright 2025 The NativeLink Authors. All rights reserved.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,10 +19,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{cmp, env};
+use std::fs::File;
+use std::io::BufReader;
+use rustls::{Certificate, ClientConfig, RootCertStore};
+use rustls_pemfile::certs;
 
 use async_trait::async_trait;
-use aws_config::default_provider::credentials;
-use aws_config::{AppName, BehaviorVersion};
+use aws_config::default_provider::credentials::DefaultCredentialsChain;
+use aws_config::BehaviorVersion;
 use aws_sdk_s3::config::Region;
 use aws_sdk_s3::operation::create_multipart_upload::CreateMultipartUploadOutput;
 use aws_sdk_s3::operation::get_object::GetObjectError;
@@ -40,9 +44,9 @@ use http_body::{Frame, SizeHint};
 use hyper::client::connect::{Connected, Connection, HttpConnector};
 use hyper::service::Service;
 use hyper::Uri;
-use hyper_rustls::{HttpsConnector, MaybeHttpsStream};
+use hyper_rustls::{ConfigBuilderExt, HttpsConnector, MaybeHttpsStream};
 use nativelink_config::stores::OntapS3Spec;
-// Note: S3 store should be very careful about the error codes it returns
+// Note: Ontap S3 store should be very careful about the error codes it returns
 // when in a retryable wrapper. Always prefer Code::Aborted or another
 // retryable code over Code::InvalidArgument or make_input_err!().
 // ie: Don't import make_input_err!() to help prevent this.
@@ -184,7 +188,7 @@ impl TlsConnector {
                 Err(e) => Some((
                     RetryResult::Retry(make_err!(
                         Code::Unavailable,
-                        "Failed to call S3 connector: {e:?}"
+                        "Failed to call Ontap S3 connector: {e:?}"
                     )),
                     connector,
                 )),
@@ -203,7 +207,7 @@ impl Service<Uri> for TlsConnector {
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.connector
             .poll_ready(cx)
-            .map_err(|e| make_err!(Code::Unavailable, "Failed poll in S3: {e}"))
+            .map_err(|e| make_err!(Code::Unavailable, "Failed poll in Ontap S3: {e}"))
     }
 
     fn call(&mut self, req: Uri) -> Self::Future {
@@ -240,9 +244,9 @@ impl http_body::Body for BodyWrapper {
 pub struct OntapS3Store<NowFn> {
     s3_client: Arc<Client>,
     now_fn: NowFn,
-    #[metric(help = "The bucket name for the S3 store")]
+    #[metric(help = "The bucket name for the Ontap S3 store")]
     bucket: String,
-    #[metric(help = "The key prefix for the S3 store")]
+    #[metric(help = "The key prefix for the Ontap S3 store")]
     key_prefix: String,
     retrier: Retrier,
     #[metric(help = "The number of seconds to consider an object expired")]
@@ -253,6 +257,38 @@ pub struct OntapS3Store<NowFn> {
     multipart_max_concurrent_uploads: usize,
 }
 
+pub fn load_custom_certs(cert_path: &str) -> Result<Arc<ClientConfig>, Error> {
+    let mut root_store = RootCertStore::empty();
+
+    // Create a BufReader from the cert file
+    let mut cert_reader = BufReader::new(
+        File::open(cert_path)
+            .map_err(|e| make_err!(Code::Internal, "Failed to open CA certificate file: {e:?}"))?,
+    );
+
+    // Parse certificates
+    let certs = certs(&mut cert_reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| make_err!(Code::Internal, "Failed to parse certificates: {e:?}"))?;
+
+    // Add each certificate to the root store
+    for cert in certs {
+        root_store.add(&Certificate(cert.to_vec())).map_err(|e| {
+            make_err!(
+                Code::Internal,
+                "Failed to add certificate to root store: {e:?}"
+            )
+        })?;
+    }
+
+    // Build the client config with the root store
+    let config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+
+    Ok(Arc::new(config))
+}
 impl<I, NowFn> OntapS3Store<NowFn>
 where
     I: InstantWrapper,
@@ -268,33 +304,66 @@ where
             let max = 1. + (jitter_amt / 2.);
             delay.mul_f32(rand::rng().random_range(min..max))
         });
-        let s3_client = {
-            let http_client =
-                HyperClientBuilder::new().build(TlsConnector::new(spec, jitter_fn.clone()));
-            let credential_provider = credentials::default_provider().await;
-            let mut config_builder = aws_config::defaults(BehaviorVersion::v2024_03_28())
-                // TODO(aaronmondal): Flip these to the default "WhenSupported".
-                //                    See: https://github.com/awslabs/aws-sdk-rust/releases/tag/release-2025-01-15
-                .request_checksum_calculation(RequestChecksumCalculation::WhenRequired)
-                .response_checksum_validation(ResponseChecksumValidation::WhenRequired)
-                .credentials_provider(credential_provider)
-                .app_name(AppName::new("nativelink").expect("valid app name"))
-                .timeout_config(
-                    aws_config::timeout::TimeoutConfig::builder()
-                        .connect_timeout(Duration::from_secs(15))
-                        .build(),
-                )
-                .region(Region::new(Cow::Owned(spec.region.clone())))
-                .http_client(http_client);
-            // TODO(allada) When aws-sdk supports this env variable we should be able
-            // to remove this.
-            // See: https://github.com/awslabs/aws-sdk-rust/issues/932
-            if let Ok(endpoint_url) = env::var("AWS_ENDPOINT_URL") {
-                config_builder = config_builder.endpoint_url(endpoint_url);
-            }
-            aws_sdk_s3::Client::new(&config_builder.load().await)
+    
+        // Load custom CA config
+        let ca_config = if let Some(cert_path) = &spec.root_certificates {
+            load_custom_certs(cert_path)?
+        } else {
+            Arc::new(
+                ClientConfig::builder()
+                    .with_safe_defaults()
+                    .with_native_roots()
+                    .with_no_client_auth(),
+            )
         };
-        Self::new_with_client_and_jitter(spec, s3_client, jitter_fn, now_fn)
+    
+        let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+            .with_tls_config((*ca_config).clone())
+            .https_only()
+            .enable_http1()
+            .enable_http2()
+            .build();
+    
+        let http_client = HyperClientBuilder::new().build(https_connector);
+    
+        let credentials_provider = DefaultCredentialsChain::builder().build().await;
+    
+        let config = aws_sdk_s3::Config::builder()
+            .credentials_provider(credentials_provider)
+            .endpoint_url(&spec.endpoint)
+            .region(Region::new(spec.vserver_name.clone()))
+            .app_name(aws_config::AppName::new("nativelink").expect("valid app name"))
+            .http_client(http_client)
+            .force_path_style(true)
+            .behavior_version(BehaviorVersion::v2024_03_28())
+            .timeout_config(
+                aws_config::timeout::TimeoutConfig::builder()
+                    .connect_timeout(Duration::from_secs(30))
+                    .operation_timeout(Duration::from_secs(120))
+                    .build(),
+            )
+            .build();
+    
+        let s3_client = aws_sdk_s3::Client::from_conf(config);
+    
+        Ok(Arc::new(Self {
+            s3_client: Arc::new(s3_client),
+            now_fn,
+            bucket: spec.bucket.clone(),
+            key_prefix: spec.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
+            retrier: Retrier::new(
+                Arc::new(|duration| Box::pin(sleep(duration))),
+                jitter_fn,
+                spec.retry.clone(),
+            ),
+            consider_expired_after_s: i64::from(spec.consider_expired_after_s),
+            max_retry_buffer_per_request: spec
+                .max_retry_buffer_per_request
+                .unwrap_or(DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST),
+            multipart_max_concurrent_uploads: spec
+                .multipart_max_concurrent_uploads
+                .unwrap_or(DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS),
+        }))
     }
 
     pub fn new_with_client_and_jitter(
@@ -357,7 +426,7 @@ where
                         Some((
                             RetryResult::Err(make_err!(
                                 Code::InvalidArgument,
-                                "Negative content length in S3: {length:?}",
+                                "Negative content length in Ontap S3: {length:?}",
                             )),
                             state,
                         ))
@@ -367,7 +436,7 @@ where
                         other => Some((
                             RetryResult::Retry(make_err!(
                                 Code::Unavailable,
-                                "Unhandled HeadObjectError in S3: {other:?}"
+                                "Unhandled HeadObjectError in Ontap S3: {other:?}"
                             )),
                             state,
                         )),
@@ -417,14 +486,6 @@ where
             UploadSizeInfo::ExactSize(sz) | UploadSizeInfo::MaxSize(sz) => sz,
         };
 
-        // Note(allada) It might be more optimal to use a different
-        // heuristic here, but for simplicity we use a hard coded value.
-        // Anything going down this if-statement will have the advantage of only
-        // 1 network request for the upload instead of minimum of 3 required for
-        // multipart upload requests.
-        //
-        // Note(allada) If the upload size is not known, we go down the multipart upload path.
-        // This is not very efficient, but it greatly reduces the complexity of the code.
         if max_size < MIN_MULTIPART_SIZE && matches!(upload_size, UploadSizeInfo::ExactSize(_)) {
             let UploadSizeInfo::ExactSize(sz) = upload_size else {
                 unreachable!("upload_size must be UploadSizeInfo::ExactSize here");
@@ -460,7 +521,7 @@ where
                         );
                         upload_res
                             .merge(bind_res)
-                            .err_tip(|| "Failed to upload file to s3 in single chunk")
+                            .err_tip(|| "Failed to upload file to Ontap s3 in single chunk")
                     };
 
                     // If we failed to upload the file, check to see if we can retry.
@@ -484,7 +545,7 @@ where
                             Level::INFO,
                             ?err,
                             ?bytes_received,
-                            "Retryable S3 error"
+                            "Retryable Ontap S3 error"
                         );
                         RetryResult::Retry(err)
                     }, |()| RetryResult::Ok(()));
@@ -507,7 +568,7 @@ where
                         |e| {
                             RetryResult::Retry(make_err!(
                                 Code::Aborted,
-                                "Failed to create multipart upload to s3: {e:?}"
+                                "Failed to create multipart upload to Ontap s3: {e:?}"
                             ))
                         },
                         |CreateMultipartUploadOutput { upload_id, .. }| {
@@ -526,7 +587,7 @@ where
             }))
             .await?;
 
-        // S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
+        // Ontap S3 requires us to upload in parts if the size is greater than 5GB. The part size must be at least
         // 5mb (except last part) and can have up to 10,000 parts.
         let bytes_per_upload_part =
             (max_size / (MIN_MULTIPART_SIZE - 1)).clamp(MIN_MULTIPART_SIZE, MAX_MULTIPART_SIZE);
@@ -543,7 +604,7 @@ where
                     let write_buf = reader
                         .consume(Some(usize::try_from(bytes_per_upload_part).err_tip(|| "Could not convert bytes_per_upload_part to usize")?))
                         .await
-                        .err_tip(|| "Failed to read chunk in s3_store")?;
+                        .err_tip(|| "Failed to read chunk in ontap_s3_store")?;
                     if write_buf.is_empty() {
                         break; // Reached EOF.
                     }
@@ -566,7 +627,7 @@ where
                                         |e| {
                                             RetryResult::Retry(make_err!(
                                                 Code::Aborted,
-                                                "Failed to upload part {part_number} in S3 store: {e:?}"
+                                                "Failed to upload part {part_number} in Ontap S3 store: {e:?}"
                                             ))
                                         },
                                         |mut response| {
@@ -584,7 +645,7 @@ where
                                 Some((retry_result, write_buf))
                             }
                         }
-                    ))).await.map_err(|_| make_err!(Code::Internal, "Failed to send part to channel in s3_store"))?;
+                    ))).await.map_err(|_| make_err!(Code::Internal, "Failed to send part to channel in ontap_s3_store"))?;
                 }
                 Result::<_, Error>::Ok(())
             }.fuse();
@@ -633,7 +694,7 @@ where
                                 |e| {
                                     RetryResult::Retry(make_err!(
                                         Code::Aborted,
-                                        "Failed to complete multipart upload in S3 store: {e:?}"
+                                        "Failed to complete multipart upload in Ontap S3 store: {e:?}"
                                     ))
                                 },
                                 |_| RetryResult::Ok(()),
@@ -660,7 +721,7 @@ where
                             |e| {
                                 let err = make_err!(
                                     Code::Aborted,
-                                    "Failed to abort multipart upload in S3 store : {e:?}"
+                                    "Failed to abort multipart upload in Ontap S3 store : {e:?}"
                                 );
                                 event!(Level::INFO, ?err, "Multipart upload error");
                                 Err(err)
@@ -713,7 +774,7 @@ where
                             return Some((
                                 RetryResult::Err(make_err!(
                                     Code::NotFound,
-                                    "No such key in S3: {e}"
+                                    "No such key in Ontap S3: {e}"
                                 )),
                                 writer,
                             ));
@@ -722,7 +783,7 @@ where
                             return Some((
                                 RetryResult::Retry(make_err!(
                                     Code::Unavailable,
-                                    "Unhandled GetObjectError in S3: {other:?}",
+                                    "Unhandled GetObjectError in Ontap S3: {other:?}",
                                 )),
                                 writer,
                             ));
@@ -730,12 +791,12 @@ where
                     },
                 };
 
-                // Copy data from s3 input stream to the writer stream.
+                // Copy data from Ontap s3 input stream to the writer stream.
                 while let Some(maybe_bytes) = s3_in_stream.next().await {
                     match maybe_bytes {
                         Ok(bytes) => {
                             if bytes.is_empty() {
-                                // Ignore possible EOF. Different implimentations of S3 may or may not
+                                // Ignore possible EOF. Different implimentations of Ontap S3 may or may not
                                 // send EOF this way.
                                 continue;
                             }
@@ -743,7 +804,7 @@ where
                                 return Some((
                                     RetryResult::Err(make_err!(
                                         Code::Aborted,
-                                        "Error sending bytes to consumer in S3: {e}"
+                                        "Error sending bytes to consumer in Ontap S3: {e}"
                                     )),
                                     writer,
                                 ));
@@ -753,7 +814,7 @@ where
                             return Some((
                                 RetryResult::Retry(make_err!(
                                     Code::Aborted,
-                                    "Bad bytestream element in S3: {e}"
+                                    "Bad bytestream element in Ontap S3: {e}"
                                 )),
                                 writer,
                             ));
@@ -764,7 +825,7 @@ where
                     return Some((
                         RetryResult::Err(make_err!(
                             Code::Aborted,
-                            "Failed to send EOF to consumer in S3: {e}"
+                            "Failed to send EOF to consumer in Ontap S3: {e}"
                         )),
                         writer,
                     ));
