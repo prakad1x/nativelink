@@ -41,7 +41,7 @@ use hyper::client::connect::{Connected, Connection, HttpConnector};
 use hyper::service::Service;
 use hyper::Uri;
 use hyper_rustls::{HttpsConnector, MaybeHttpsStream};
-use nativelink_config::stores::S3Spec;
+use nativelink_config::stores::OntapS3Spec;
 // Note: S3 store should be very careful about the error codes it returns
 // when in a retryable wrapper. Always prefer Code::Aborted or another
 // retryable code over Code::InvalidArgument or make_input_err!().
@@ -142,7 +142,7 @@ pub struct TlsConnector {
 
 impl TlsConnector {
     #[must_use]
-    pub fn new(spec: &S3Spec, jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>) -> Self {
+    pub fn new(spec: &OntapS3Spec, jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>) -> Self {
         let connector_with_roots = hyper_rustls::HttpsConnectorBuilder::new().with_webpki_roots();
 
         let connector_with_schemes = if spec.insecure_allow_http {
@@ -237,7 +237,7 @@ impl http_body::Body for BodyWrapper {
 }
 
 #[derive(MetricsComponent)]
-pub struct S3Store<NowFn> {
+pub struct OntapS3Store<NowFn> {
     s3_client: Arc<Client>,
     now_fn: NowFn,
     #[metric(help = "The bucket name for the S3 store")]
@@ -253,12 +253,12 @@ pub struct S3Store<NowFn> {
     multipart_max_concurrent_uploads: usize,
 }
 
-impl<I, NowFn> S3Store<NowFn>
+impl<I, NowFn> OntapS3Store<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
-    pub async fn new(spec: &S3Spec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
+    pub async fn new(spec: &OntapS3Spec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
         let jitter_amt = spec.retry.jitter;
         let jitter_fn = Arc::new(move |delay: Duration| {
             if jitter_amt == 0. {
@@ -298,7 +298,7 @@ where
     }
 
     pub fn new_with_client_and_jitter(
-        spec: &S3Spec,
+        spec: &OntapS3Spec,
         s3_client: Client,
         jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
         now_fn: NowFn,
@@ -379,7 +379,7 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn> StoreDriver for S3Store<NowFn>
+impl<I, NowFn> StoreDriver for OntapS3Store<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
@@ -473,13 +473,13 @@ where
                                 Level::ERROR,
                                 ?bytes_received,
                                 err = ?try_reset_err,
-                                "Unable to reset stream after failed upload in S3Store::update"
+                                "Unable to reset stream after failed upload in OntapS3Store::update"
                             );
                             return RetryResult::Err(err
                                 .merge(try_reset_err)
-                                .append(format!("Failed to retry upload with {bytes_received} bytes received in S3Store::update")));
+                                .append(format!("Failed to retry upload with {bytes_received} bytes received in OntapS3Store::update")));
                         }
-                        let err = err.append(format!("Retry on upload happened with {bytes_received} bytes received in S3Store::update"));
+                        let err = err.append(format!("Retry on upload happened with {bytes_received} bytes received in OntapS3Store::update"));
                         event!(
                             Level::INFO,
                             ?err,
@@ -792,13 +792,13 @@ where
 }
 
 #[async_trait]
-impl<I, NowFn> HealthStatusIndicator for S3Store<NowFn>
+impl<I, NowFn> HealthStatusIndicator for OntapS3Store<NowFn>
 where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
     fn get_name(&self) -> &'static str {
-        "S3Store"
+        "OntapS3Store"
     }
 
     async fn check_health(&self, namespace: Cow<'static, str>) -> HealthStatus {
