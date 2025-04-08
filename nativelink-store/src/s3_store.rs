@@ -68,6 +68,8 @@ use nativelink_util::instant_wrapper::InstantWrapper;
 use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rand::Rng;
+use rustls::{Certificate, ClientConfig, RootCertStore};
+use rustls_pemfile::certs;
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{event, Level};
@@ -103,7 +105,31 @@ pub struct TlsClient {
 impl TlsClient {
     #[must_use]
     pub fn new(spec: &S3Spec, jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>) -> Self {
-        let connector_with_roots = HttpsConnectorBuilder::new().with_webpki_roots();
+        let connector_with_roots = if spec.s3_type == S3Type::ONTAP && spec.root_certificates.is_some() {
+            // Load custom certificates for ONTAP
+            let cert_path = spec.root_certificates.as_ref().unwrap();
+            match std::fs::read(cert_path) {
+                Ok(cert_data) => {
+                    let mut root_store = rustls::RootCertStore::empty();
+                    let certs = rustls_pemfile::certs(&mut &*cert_data)
+                        .filter_map(|result| result.ok())
+                        .collect::<Vec<_>>();
+                    
+                    for cert in certs {
+                        let _ = root_store.add(&rustls::Certificate(cert));
+                    }
+                    let tls_config = rustls::ClientConfig::builder()
+                        .with_safe_defaults()
+                        .with_root_certificates(root_store)
+                        .with_no_client_auth();
+                    
+                    HttpsConnectorBuilder::new().with_tls_config(tls_config)
+                }
+                Err(_) => HttpsConnectorBuilder::new().with_webpki_roots()
+            }
+        } else {
+            HttpsConnectorBuilder::new().with_webpki_roots()
+        };
 
         let connector_with_schemes = if spec.insecure_allow_http {
             connector_with_roots.https_or_http()
@@ -445,32 +471,72 @@ where
             let max = 1. + (jitter_amt / 2.);
             delay.mul_f32(rand::rng().random_range(min..max))
         });
-        let s3_client = {
+            let s3_client = {
             let http_client = TlsClient::new(&spec.clone(), jitter_fn.clone());
 
-            let credential_provider = credentials::DefaultCredentialsChain::builder()
-                .configure(
-                    ProviderConfig::without_region()
-                        .with_region(Some(Region::new(Cow::Owned(spec.region.clone()))))
-                        .with_http_client(http_client.clone()),
-                )
-                .build()
-                .await;
+            // Check if this is ONTAP S3 configuration
+            let is_ontap = spec.s3_type == S3Type::ONTAP || spec.vserver_name.is_some();
 
-            let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
-                .credentials_provider(credential_provider)
-                .app_name(AppName::new("nativelink").expect("valid app name"))
-                .timeout_config(
-                    aws_config::timeout::TimeoutConfig::builder()
-                        .connect_timeout(Duration::from_secs(15))
-                        .build(),
-                )
-                .region(Region::new(Cow::Owned(spec.region.clone())))
-                .http_client(http_client)
-                .load()
-                .await;
+            if is_ontap {
+                // ONTAP S3 configuration
+                let vserver_name = spec.vserver_name.clone().unwrap_or_else(|| "us-east-1".to_string());
+                let credential_provider = credentials::DefaultCredentialsChain::builder()
+                    .configure(
+                        ProviderConfig::without_region()
+                            .with_region(Some(Region::new(Cow::Owned(vserver_name.clone()))))
+                            .with_http_client(http_client.clone()),
+                    )
+                    .build()
+                    .await;
+                
+                let endpoint = spec.endpoint.clone().unwrap_or_else(|| 
+                    format!("https://{}.s3.amazonaws.com", spec.bucket));
+                
+                let mut config_builder = aws_config::defaults(BehaviorVersion::v2025_01_17())
+                    .credentials_provider(credential_provider)
+                    .app_name(AppName::new("nativelink").expect("valid app name"))
+                    .timeout_config(
+                        aws_config::timeout::TimeoutConfig::builder()
+                            .connect_timeout(Duration::from_secs(15))
+                            .build(),
+                    )
+                    .region(Region::new(Cow::Owned(vserver_name)))
+                    .http_client(http_client);
+                
+                // Load the config and create client with endpoint and path style
+                let config = config_builder.load().await;
+                
+                aws_sdk_s3::config::Builder::from(&config)
+                    .endpoint_url(endpoint)
+                    .force_path_style(true)
+                    .build()
+                    .into()
+            } else {
+                // Standard AWS S3 configuration (unchanged)
+                let credential_provider = credentials::DefaultCredentialsChain::builder()
+                    .configure(
+                        ProviderConfig::without_region()
+                            .with_region(Some(Region::new(Cow::Owned(spec.region.clone()))))
+                            .with_http_client(http_client.clone()),
+                    )
+                    .build()
+                    .await;
+    
+                let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+                    .credentials_provider(credential_provider)
+                    .app_name(AppName::new("nativelink").expect("valid app name"))
+                    .timeout_config(
+                        aws_config::timeout::TimeoutConfig::builder()
+                            .connect_timeout(Duration::from_secs(15))
+                            .build(),
+                    )
+                    .region(Region::new(Cow::Owned(spec.region.clone())))
+                    .http_client(http_client)
+                    .load()
+                    .await;
 
-            aws_sdk_s3::Client::new(&config)
+                aws_sdk_s3::Client::new(&config)
+            }
         };
         Self::new_with_client_and_jitter(spec, s3_client, jitter_fn, now_fn)
     }

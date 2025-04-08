@@ -722,12 +722,44 @@ pub struct EvictionPolicy {
     pub max_count: u64,
 }
 
+#[allow(non_camel_case_types)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
+pub enum S3Type {
+    #[serde(rename = "aws")]
+    AWS,
+    #[serde(rename = "ontap")]
+    ONTAP,
+}
+
+impl Default for S3Type {
+    fn default() -> Self {
+        S3Type::AWS
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Default, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct S3Spec {
+    /// S3 implementation type (AWS or ONTAP)
+    #[serde(default)]
+    pub s3_type: S3Type,
+
     /// S3 region. Usually us-east-1, us-west-2, af-south-1, exc...
+    /// For AWS S3 only.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
     pub region: String,
+
+    /// Required endpoint URL for ONTAP S3, optional for AWS S3
+    #[serde(default)]
+    pub endpoint: Option<String>,
+
+    /// vServer name for ONTAP S3, replaces region
+    #[serde(default)]
+    pub vserver_name: Option<String>,
+
+    /// Path to custom root certificates for ONTAP S3
+    #[serde(default)]
+    pub root_certificates: Option<String>,
 
     /// Bucket name to use as the backend.
     #[serde(default, deserialize_with = "convert_string_with_shellexpand")]
