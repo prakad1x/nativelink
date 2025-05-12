@@ -19,6 +19,10 @@ use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::sync::Arc;
+use rustls::{Certificate, ClientConfig, RootCertStore};
+use rustls_pemfile::certs;
+use std::fs::File;
+use std::io::BufReader;
 
 use async_trait::async_trait;
 use aws_config::default_provider::credentials;
@@ -52,7 +56,7 @@ use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::Client as LegacyClient;
 use hyper_util::client::legacy::connect::HttpConnector as LegacyHttpConnector;
 use hyper_util::rt::TokioExecutor;
-use nativelink_config::stores::ExperimentalAwsSpec;
+use nativelink_config::stores::{ExperimentalAwsSpec, ExperimentalCloudObjectSpec, ExperimentalOntapS3Spec, Retry};
 // Note: S3 store should be very careful about the error codes it returns
 // when in a retryable wrapper. Always prefer Code::Aborted or another
 // retryable code over Code::InvalidArgument or make_input_err!().
@@ -131,6 +135,38 @@ impl TlsClient {
             ),
         }
     }
+
+    #[must_use]
+    pub fn new_with_config(
+        spec: &ExperimentalOntapS3Spec,
+        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
+        client_config: Arc<ClientConfig>,
+    ) -> Result<Self, Error> {
+        let connector_builder = HttpsConnectorBuilder::new().with_tls_config((*client_config).clone());
+        
+        let connector_with_schemes = if spec.common.insecure_allow_http {
+            connector_builder.https_or_http()
+        } else {
+            connector_builder.https_only()
+        };
+        
+        let connector = if spec.common.disable_http2 {
+            connector_with_schemes.enable_http1().build()
+        } else {
+            connector_with_schemes.enable_http1().enable_http2().build()
+        };
+        
+        let client = LegacyClient::builder(TokioExecutor::new()).build(connector);
+        
+        Ok(Self {
+            client,
+            retrier: Retrier::new(
+                Arc::new(|duration| Box::pin(sleep(duration))),
+                jitter_fn,
+                spec.common.retry.clone(),
+            ),
+        })
+    }
 }
 
 impl core::fmt::Debug for TlsClient {
@@ -147,6 +183,70 @@ impl SmithyHttpClient for TlsClient {
     ) -> SharedHttpConnector {
         SharedHttpConnector::new(self.clone())
     }
+}
+
+async fn create_s3_client_for_ontap(
+    spec: &ExperimentalOntapS3Spec,
+    jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
+) -> Result<Client, Error> {
+    // Load custom CA certificates if provided
+    let root_store = if let Some(cert_path) = &spec.root_certificates {
+        let mut root_store = RootCertStore::empty();
+        
+        let mut cert_reader = BufReader::new(
+            File::open(cert_path)
+                .map_err(|e| make_err!(Code::Internal, "Failed to open CA certificate file: {e:?}"))?
+        );
+        
+        let certs = certs(&mut cert_reader)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| make_err!(Code::Internal, "Failed to parse certificates: {e:?}"))?;
+        
+        for cert in certs {
+            root_store.add(&Certificate(cert.to_vec()))
+                .map_err(|e| make_err!(Code::Internal, "Failed to add certificate to root store: {e:?}"))?;
+        }
+        
+        root_store
+    } else {
+        let mut root_store = RootCertStore::empty();
+        for cert in webpki_roots::TLS_SERVER_ROOTS {
+            root_store.add(cert).map_err(|e| 
+                make_err!(Code::Internal, "Failed to add default root certificate: {e:?}"))?;
+        }
+        root_store
+    };
+    
+    // Create custom TLS configuration
+    let client_config = ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    
+    // Create HTTP client with custom TLS
+    let tls_client = TlsClient::new_with_config(spec, jitter_fn, Arc::new(client_config))?;
+    
+    // Create S3 client with ONTAP configuration
+    let credentials_provider = credentials::DefaultCredentialsChain::builder()
+        .build()
+        .await;
+    
+    let config = aws_config::defaults(BehaviorVersion::v2025_01_17())
+        .credentials_provider(credentials_provider)
+        .app_name(AppName::new("nativelink").expect("valid app name"))
+        .timeout_config(
+            aws_config::timeout::TimeoutConfig::builder()
+                .connect_timeout(Duration::from_secs(15))
+                .build(),
+        )
+        .region(Region::new(Cow::Owned(spec.vserver_name.clone())))
+        .endpoint_url(&spec.endpoint)
+        .http_client(tls_client)
+        .force_path_style(true)  // ONTAP requires path-style access
+        .load()
+        .await;
+    
+    Ok(Client::new(&config))
 }
 
 enum BufferedBodyState {
@@ -438,7 +538,21 @@ where
     I: InstantWrapper,
     NowFn: Fn() -> I + Send + Sync + Unpin + 'static,
 {
-    pub async fn new(spec: &ExperimentalAwsSpec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
+    pub async fn new(spec: &ExperimentalCloudObjectSpec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
+        match spec {
+            ExperimentalCloudObjectSpec::Aws(aws_spec) => {
+                Self::new_aws(aws_spec, now_fn).await
+            }
+            ExperimentalCloudObjectSpec::Ontap(ontap_spec) => {
+                Self::new_ontap(ontap_spec, now_fn).await
+            }
+            ExperimentalCloudObjectSpec::Gcs(_) => {
+                Err(make_err!(Code::InvalidArgument, "GCS is not supported by S3Store"))
+            }
+        }
+    }
+    
+    async fn new_aws(spec: &ExperimentalAwsSpec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
         let jitter_amt = spec.common.retry.jitter;
         let jitter_fn = Arc::new(move |delay: Duration| {
             if jitter_amt == 0. {
@@ -473,40 +587,94 @@ where
 
             Client::new(&config)
         };
-        Self::new_with_client_and_jitter(spec, s3_client, jitter_fn, now_fn)
+        Self::new_with_client_and_jitter(
+            spec.bucket.clone(),
+            spec.common.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
+            spec.common.retry.clone(),
+            i64::from(spec.common.consider_expired_after_s),
+            spec.common.max_retry_buffer_per_request,
+            spec.common.multipart_max_concurrent_uploads,
+            s3_client,
+            jitter_fn,
+            now_fn,
+        )
+    }
+    
+    async fn new_ontap(spec: &ExperimentalOntapS3Spec, now_fn: NowFn) -> Result<Arc<Self>, Error> {
+        let jitter_amt = spec.common.retry.jitter;
+        let jitter_fn = Arc::new(move |delay: Duration| {
+            if jitter_amt == 0. {
+                return delay;
+            }
+            delay.mul_f32(jitter_amt.mul_add(rand::rng().random::<f32>() - 0.5, 1.))
+        });
+        
+        let s3_client = create_s3_client_for_ontap(spec, jitter_fn.clone()).await?;
+        
+        Self::new_with_client_and_jitter(
+            spec.bucket.clone(),
+            spec.common.key_prefix.as_ref().unwrap_or(&String::new()).clone(),
+            spec.common.retry.clone(),
+            i64::from(spec.common.consider_expired_after_s),
+            spec.common.max_retry_buffer_per_request,
+            spec.common.multipart_max_concurrent_uploads,
+            s3_client,
+            jitter_fn,
+            now_fn,
+        )
     }
 
     pub fn new_with_client_and_jitter(
-        spec: &ExperimentalAwsSpec,
-        s3_client: Client,
-        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
-        now_fn: NowFn,
+    bucket: String,
+    key_prefix: String,
+    retry: Retry,
+    consider_expired_after_s: i64,
+    max_retry_buffer_per_request: Option<usize>,
+    multipart_max_concurrent_uploads: Option<usize>,
+    s3_client: Client,
+    jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
+    now_fn: NowFn,
     ) -> Result<Arc<Self>, Error> {
         Ok(Arc::new(Self {
             s3_client: Arc::new(s3_client),
             now_fn,
-            bucket: spec.bucket.to_string(),
-            key_prefix: spec
-                .common
-                .key_prefix
-                .as_ref()
-                .unwrap_or(&String::new())
-                .clone(),
+            bucket,
+            key_prefix,
             retrier: Retrier::new(
                 Arc::new(|duration| Box::pin(sleep(duration))),
                 jitter_fn,
-                spec.common.retry.clone(),
+                retry,
             ),
-            consider_expired_after_s: i64::from(spec.common.consider_expired_after_s),
-            max_retry_buffer_per_request: spec
-                .common
-                .max_retry_buffer_per_request
+            consider_expired_after_s,
+            max_retry_buffer_per_request: max_retry_buffer_per_request
                 .unwrap_or(DEFAULT_MAX_RETRY_BUFFER_PER_REQUEST),
-            multipart_max_concurrent_uploads: spec
-                .common
-                .multipart_max_concurrent_uploads
-                .map_or(DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS, |v| v),
+            multipart_max_concurrent_uploads: multipart_max_concurrent_uploads
+                .unwrap_or(DEFAULT_MULTIPART_MAX_CONCURRENT_UPLOADS),
         }))
+    }
+
+    fn new_with_config(
+        bucket: String,
+        key_prefix: String,
+        retry: Retry,
+        consider_expired_after_s: i64,
+        max_retry_buffer_per_request: Option<usize>,
+        multipart_max_concurrent_uploads: Option<usize>,
+        s3_client: Client,
+        jitter_fn: Arc<dyn Fn(Duration) -> Duration + Send + Sync>,
+        now_fn: NowFn,
+    ) -> Result<Arc<Self>, Error> {
+        Self::new_with_client_and_jitter(
+            bucket,
+            key_prefix,
+            retry,
+            consider_expired_after_s,
+            max_retry_buffer_per_request,
+            multipart_max_concurrent_uploads,
+            s3_client,
+            jitter_fn,
+            now_fn,
+        )
     }
 
     fn make_s3_path(&self, key: &StoreKey<'_>) -> String {

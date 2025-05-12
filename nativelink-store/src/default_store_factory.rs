@@ -52,11 +52,14 @@ pub fn store_factory<'a>(
         let store: Arc<dyn StoreDriver> = match backend {
             StoreSpec::Memory(spec) => MemoryStore::new(spec),
             StoreSpec::ExperimentalCloudObjectStore(spec) => match spec {
-                ExperimentalCloudObjectSpec::Aws(aws_config) => {
-                    S3Store::new(aws_config, SystemTime::now).await?
+                ExperimentalCloudObjectSpec::Aws(_) => {
+                    S3Store::new(spec, SystemTime::now).await?
                 }
                 ExperimentalCloudObjectSpec::Gcs(gcs_config) => {
                     GcsStore::new(gcs_config, SystemTime::now).await?
+                }
+                ExperimentalCloudObjectSpec::Ontap(_) => {
+                    S3Store::new(spec, SystemTime::now).await?
                 }
             },
             StoreSpec::RedisStore(spec) => RedisStore::new(spec.clone())?,

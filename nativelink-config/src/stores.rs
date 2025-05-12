@@ -99,6 +99,28 @@ pub enum StoreSpec {
     ///     "multipart_max_concurrent_uploads": 10
     ///   }
     ///   ```
+    /// 3. **NetApp ONTAP S3:**
+    ///    ONTAP S3 store uses NetApp's ONTAP S3-compatible storage as a backend
+    ///    to store files. This configuration can be used with ONTAP clusters
+    ///    that have S3 enabled.
+    ///
+    ///   **Example JSON Config:**
+    ///   ```json
+    ///   "experimental_cloud_object_store": {
+    ///     "provider": "ontap",
+    ///     "endpoint": "https://ontap-cluster:443",
+    ///     "vserver_name": "test-svm",
+    ///     "bucket": "test-bucket",
+    ///     "root_certificates": "/path/to/ca.pem",
+    ///     "key_prefix": "test-prefix/",
+    ///     "retry": {
+    ///       "max_retries": 6,
+    ///       "delay": 0.3,
+    ///       "jitter": 0.5
+    ///     },
+    ///     "multipart_max_concurrent_uploads": 10
+    ///   }
+    ///   ```
     ///
     ExperimentalCloudObjectStore(ExperimentalCloudObjectSpec),
 
@@ -751,6 +773,7 @@ pub struct EvictionPolicy {
 pub enum ExperimentalCloudObjectSpec {
     Aws(ExperimentalAwsSpec),
     Gcs(ExperimentalGcsSpec),
+    Ontap(ExperimentalOntapS3Spec),
 }
 
 impl Default for ExperimentalCloudObjectSpec {
@@ -788,6 +811,30 @@ pub struct ExperimentalGcsSpec {
     pub resumable_chunk_size: Option<usize>,
 
     /// Common retry and upload configuration
+    #[serde(flatten)]
+    pub common: CommonObjectSpec,
+}
+
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+#[serde(deny_unknown_fields)]
+pub struct ExperimentalOntapS3Spec {
+    /// ONTAP S3 endpoint URL (e.g., https://ontap-cluster:443)
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub endpoint: String,
+
+    /// The vserver name for ONTAP S3
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub vserver_name: String,
+
+    /// Bucket name to use as the backend
+    #[serde(deserialize_with = "convert_string_with_shellexpand")]
+    pub bucket: String,
+
+    /// Optional path to custom root certificates for TLS
+    #[serde(default)]
+    pub root_certificates: Option<String>,
+
+    /// Common S3 configuration options (retry, key_prefix, etc.)
     #[serde(flatten)]
     pub common: CommonObjectSpec,
 }
