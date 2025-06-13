@@ -221,7 +221,7 @@ async fn simple_update_ac() -> Result<(), Error> {
     const AC_ENTRY_SIZE: u64 = 199;
     const CONTENT_LENGTH: usize = 50;
 
-    let mut send_data = BytesMut::new();
+    let mut send_data = BytesMut::with_capacity(CONTENT_LENGTH);
     for i in 0..CONTENT_LENGTH {
         send_data.put_u8(((i % 93) + 33) as u8); // Printable characters only.
     }
@@ -261,7 +261,7 @@ async fn simple_update_ac() -> Result<(), Error> {
 
     // Make future responsible for processing the datastream
     // and forwarding it to the s3 backend/server.
-    let mut update_fut = Box::pin(async move {
+    let update_fut = Box::pin(async move {
         store
             .update(
                 DigestInfo::try_new(VALID_HASH1, AC_ENTRY_SIZE)?,
@@ -271,11 +271,28 @@ async fn simple_update_ac() -> Result<(), Error> {
             .await
     });
 
+    let send_data_copy = send_data.clone();
+    // Create spawn that is responsible for sending the stream of data
+    // to the S3Store and processing/forwarding to the S3 backend.
+    let sender_fut = spawn!("sender", async move {
+        for i in 0..CONTENT_LENGTH {
+            tx.send(send_data_copy.slice(i..=i)).await?;
+        }
+        tx.send_eof()
+    });
+
     // Extract out the body stream sent by the s3 store.
     let body_stream = {
         // We need to poll here to get the request sent, but future
         // wont be done until we send all the data (which we do later).
-        assert_eq!(futures::poll!(&mut update_fut), core::task::Poll::Pending);
+
+        update_fut.await.err_tip(|| "Error in update function")?;
+        // Collect our spawn future to ensure it completes without error.
+        sender_fut
+            .await
+            .err_tip(|| "Failed to launch spawn")?
+            .err_tip(|| "In spawn")?;
+
         let sent_request = request_receiver.expect_request();
         assert_eq!(sent_request.method(), "PUT");
         assert_eq!(
@@ -284,26 +301,17 @@ async fn simple_update_ac() -> Result<(), Error> {
                 "https://{BUCKET_NAME}.s3.{VSERVER_NAME}.amazonaws.com/{VALID_HASH1}-{AC_ENTRY_SIZE}?x-id=PutObject"
             )
         );
+        let headers = sent_request.headers();
+        assert_eq!(
+            headers.get("x-amz-content-sha256"),
+            Some("UNSIGNED-PAYLOAD")
+        );
+        assert_eq!(
+            headers.get("x-amz-checksum-sha256"),
+            Some("ZAbm15cMyBMkq2sUXRgXHNb3az8dLCm3tnyixpdxF+o")
+        );
         aws_sdk_s3::primitives::ByteStream::from_body_0_4(sent_request.into_body())
     };
-
-    let send_data_copy = send_data.clone();
-    // Create spawn that is responsible for sending the stream of data
-    // to the S3Store and processing/forwarding to the S3 backend.
-    let spawn_fut = spawn!("simple_update_ac", async move {
-        tokio::try_join!(update_fut, async move {
-            for i in 0..CONTENT_LENGTH {
-                tx.send(send_data_copy.slice(i..=i)).await?;
-            }
-            tx.send_eof()
-        })
-        .or_else(|e| {
-            // Printing error to make it easier to debug, since ordering
-            // of futures is not guaranteed.
-            eprintln!("Error updating or sending in spawn: {e:?}");
-            Err(e)
-        })
-    });
 
     // Wait for all the data to be received by the s3 backend server.
     let data_sent_to_s3 = body_stream
@@ -325,12 +333,6 @@ async fn simple_update_ac() -> Result<(), Error> {
         received_data
     };
     assert_eq!(send_data, data_content, "Expected content data to match");
-
-    // Collect our spawn future to ensure it completes without error.
-    spawn_fut
-        .await
-        .err_tip(|| "Failed to launch spawn")?
-        .err_tip(|| "In spawn")?;
 
     Ok(())
 }

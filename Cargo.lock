@@ -2420,6 +2420,7 @@ dependencies = [
  "aws-smithy-runtime",
  "aws-smithy-runtime-api",
  "aws-smithy-types",
+ "base64 0.22.1",
  "bincode",
  "blake3",
  "byteorder",

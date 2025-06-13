@@ -31,7 +31,10 @@ use aws_sdk_s3::operation::get_object::GetObjectError;
 use aws_sdk_s3::operation::head_object::HeadObjectError;
 use aws_sdk_s3::primitives::{ByteStream, SdkBody};
 use aws_sdk_s3::types::builders::{CompletedMultipartUploadBuilder, CompletedPartBuilder};
-use futures::future::FusedFuture;
+use base64::Engine;
+use base64::prelude::BASE64_STANDARD_NO_PAD;
+use bytes::BytesMut;
+use futures::future::{Either, FusedFuture};
 use futures::stream::{FuturesUnordered, unfold};
 use futures::{FutureExt, StreamExt, TryFutureExt, TryStreamExt};
 use hyper_rustls::ConfigBuilderExt;
@@ -47,11 +50,12 @@ use nativelink_util::retry::{Retrier, RetryResult};
 use nativelink_util::store_trait::{StoreDriver, StoreKey, UploadSizeInfo};
 use rustls::{ClientConfig, RootCertStore};
 use rustls_pemfile::certs;
+use sha2::{Digest, Sha256};
 use tokio::time::sleep;
-use tracing::{Level, event};
+use tracing::{Level, event, warn};
 
 use crate::cas_utils::is_zero_digest;
-use crate::common_s3_utils::{BodyWrapper, TlsClient};
+use crate::common_s3_utils::TlsClient;
 
 // S3 parts cannot be smaller than this number
 const MIN_MULTIPART_SIZE: u64 = 5 * 1024 * 1024; // 5MB
@@ -336,27 +340,59 @@ where
             );
             return self.retrier.retry(
                 unfold(reader, move |mut reader| async move {
-                    let (mut tx, rx) = make_buf_channel_pair();
+                    let (mut tx, mut rx) = make_buf_channel_pair();
 
                     let result = {
                         let reader_ref = &mut reader;
-                        let (upload_res, bind_res) = tokio::join!(
-                            self.s3_client
-                                .put_object()
-                                .bucket(&self.bucket)
-                                .key(s3_path.clone())
-                                .content_length(sz as i64)
-                                .body(
-                                    ByteStream::from_body_1_x(BodyWrapper {
-                                        reader: rx,
-                                        size: sz,
-                                    })
-                                )
-                                .send()
-                                .map_ok_or_else(
-                                    |e| Err(make_err!(Code::Aborted, "{e:?}")),
-                                    |_| Ok(())
-                                ),
+                        let (upload_res, bind_res): (Result<(), Error>, Result<(), Error>) = tokio::join!(async move {
+                            let raw_body_bytes = {
+                                let mut raw_body_chunks = BytesMut::new();
+                                loop {
+                                    match rx.recv().await {
+                                        Ok(chunk) => {
+                                            if chunk.is_empty() {
+                                                break Ok(raw_body_chunks.freeze());
+                                            }
+                                            raw_body_chunks.extend_from_slice(&chunk);
+                                        }
+                                        Err(err) => {
+                                            break Err(err);
+                                        }
+                                    }
+                                }
+                            };
+                            let internal_res = match raw_body_bytes {
+                                Ok(body_bytes) => {
+                                    let hash = Sha256::digest(&body_bytes);
+                                    let send_res = self.s3_client
+                                        .put_object()
+                                        .bucket(&self.bucket)
+                                        .key(s3_path.clone())
+                                        .content_length(sz as i64)
+                                        .body(
+                                            ByteStream::from(body_bytes)
+                                        )
+                                        .set_checksum_algorithm(Some(aws_sdk_s3::types::ChecksumAlgorithm::Sha256))
+                                        .set_checksum_sha256(Some(BASE64_STANDARD_NO_PAD.encode(hash)))
+                                        .customize()
+                                        .mutate_request(|req| {req.headers_mut().insert("x-amz-content-sha256", "UNSIGNED-PAYLOAD");})
+                                        .send();
+                                    Either::Left(send_res.map_ok_or_else(|e| Err(make_err!(Code::Aborted, "{e:?}")), |_| Ok(())))
+                                    }
+                                Err(collect_err) => {
+                                    async fn make_collect_err(collect_err: Error) -> Result<(), Error> {
+                                        Err(collect_err.into())
+                                    }
+
+                                    warn!(
+                                        ?collect_err,
+                                        "Failed to get body");
+                                    let future_err = make_collect_err(collect_err);
+                                    Either::Right(future_err)
+                                }
+                            };
+                            internal_res.await
+                        },
                             tx.bind_buffered(reader_ref)
                         );
                         upload_res
